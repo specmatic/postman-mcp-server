@@ -3,8 +3,9 @@
 import dotenv from 'dotenv';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { InitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
+  InitializeRequest,
   ErrorCode,
   isInitializeRequest,
   IsomorphicHeaders,
@@ -146,6 +147,7 @@ let clientInfo: InitializeRequest['params']['clientInfo'] | undefined = undefine
 async function run() {
   const args = process.argv.slice(2);
   const useFull = args.includes('--full');
+  const useHttp = args.includes('--http');
 
   const regionIndex = args.findIndex((arg) => arg === '--region');
   if (regionIndex !== -1 && regionIndex + 1 < args.length) {
@@ -163,10 +165,10 @@ async function run() {
     }
   }
 
-  // For STDIO mode, validate API key is available in environment
+  // For STDIO or HTTP mode, validate API key is available in environment
   const apiKey = process.env.POSTMAN_API_KEY;
   if (!apiKey) {
-    log('error', 'POSTMAN_API_KEY environment variable is required for STDIO mode');
+    log('error', 'POSTMAN_API_KEY environment variable is required for STDIO or HTTP mode');
     process.exit(1);
   }
 
@@ -198,7 +200,7 @@ async function run() {
     process.exit(0);
   });
 
-  // Create a client instance with the API key for STDIO mode
+  // Create a client instance with the API key for STDIO or HTTP mode
   const client = new PostmanAPIClient(apiKey);
 
   log('info', 'Registering tools with McpServer');
@@ -244,7 +246,15 @@ async function run() {
     );
   }
 
-  // API key validation is handled by the singleton client
+  if (useHttp) {
+    await startMcpServerInStreamableHTTPMode({ server, tools, useFull });
+  } else {
+    await startMcpServerInSTDIOMode({ server, tools, useFull });
+  }
+}
+
+const startMcpServerInSTDIOMode = async ({ server, tools, useFull }) => {
+  // STDIO mode
   log('info', 'Starting stdio transport');
   const transport = new StdioServerTransport();
   transport.onmessage = (message) => {
@@ -259,7 +269,57 @@ async function run() {
     'info',
     `Server connected and ready: ${SERVER_NAME}@${APP_VERSION} with ${tools.length} tools (${useFull ? 'full' : 'minimal'})`
   );
-}
+};
+
+const startMcpServerInStreamableHTTPMode = async ({ server, tools, useFull }) => {
+  log('info', 'Starting streamable HTTP transport');
+  const express = (await import('express')).default;
+  const app = express();
+  const port = process.env.PORT ? Number(process.env.PORT) : 3000;
+  app.use(express.json());
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined, // Stateless mode
+  });
+
+  transport.onmessage = (message) => {
+    if (isInitializeRequest(message)) {
+      clientInfo = message.params.clientInfo;
+      log('debug', '📥 Received MCP initialize request', { clientInfo });
+    }
+  };
+  await server.connect(transport);
+
+  app.get('/health', (_, res) => {
+    res.send('OK');
+  });
+
+  app.post('/', async (req, res) => {
+    try {
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      log('error', 'Error handling request', { error: String(error) });
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: '2.0',
+          error: {
+            code: ErrorCode.InternalError,
+            message: 'Internal server error',
+          },
+          id: null,
+        });
+      }
+    }
+  });
+
+  app.listen(port, () => {
+    logBoth(
+      server,
+      'info',
+      `Server connected and ready (HTTP): ${SERVER_NAME}@${APP_VERSION} with ${tools.length} tools (${useFull ? 'full' : 'minimal'}) on port ${port}`
+    );
+  });
+};
 
 run().catch((error: unknown) => {
   log('error', 'Unhandled error during server execution', {
