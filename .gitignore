@@ -1,2 +1,4 @@
 node_modules/
 *-benchmark-results.json
+build
+.idea
